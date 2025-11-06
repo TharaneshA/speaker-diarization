@@ -1,11 +1,10 @@
+# voice_analyzer/audio.py
 from scipy.ndimage.morphology import binary_dilation
 from voice_analyzer.hparams import *
 from pathlib import Path
 from typing import Optional, Union
 import numpy as np
-import webrtcvad
 import librosa
-import struct
 
 int16_max = (2 ** 15) - 1
 
@@ -19,10 +18,13 @@ def preprocess_wav(fpath_or_wav: Union[str, Path, np.ndarray], source_sr: Option
         wav = librosa.resample(wav, orig_sr=source_sr, target_sr=sampling_rate)
 
     wav = normalize_volume(wav, audio_norm_target_dBFS, increase_only=True)
-    wav = trim_long_silences(wav)
+    wav = trim_silences_by_energy(wav)
     return wav
 
 def wav_to_mel_spectrogram(wav):
+    """
+    Derives a mel spectrogram ready to be used by the encoder from a preprocessed audio waveform.
+    """
     frames = librosa.feature.melspectrogram(
         y=wav,
         sr=sampling_rate,
@@ -32,28 +34,32 @@ def wav_to_mel_spectrogram(wav):
     )
     return frames.astype(np.float32).T
 
-def trim_long_silences(wav):
-    samples_per_window = (vad_window_length * sampling_rate) // 1000
-    wav = wav[:len(wav) - (len(wav) % samples_per_window)]
-    pcm_wave = struct.pack("%dh" % len(wav), *(np.round(wav * int16_max)).astype(np.int16))
-    voice_flags = []
-    vad = webrtcvad.Vad(mode=3)
-    for window_start in range(0, len(wav), samples_per_window):
-        window_end = window_start + samples_per_window
-        voice_flags.append(vad.is_speech(pcm_wave[window_start * 2:window_end * 2], sample_rate=sampling_rate))
-    voice_flags = np.array(voice_flags)
-
-    def moving_average(array, width):
-        array_padded = np.concatenate((np.zeros((width - 1) // 2), array, np.zeros(width // 2)))
-        ret = np.cumsum(array_padded, dtype=float)
-        ret[width:] = ret[width:] - ret[:-width]
-        return ret[width - 1:] / width
-
-    audio_mask = moving_average(voice_flags, vad_moving_average_width)
-    audio_mask = np.round(audio_mask).astype(bool)
-    audio_mask = binary_dilation(audio_mask, np.ones(vad_max_silence_length + 1))
-    audio_mask = np.repeat(audio_mask, samples_per_window)
-    return wav[audio_mask]
+def trim_silences_by_energy(wav, energy_threshold=0.05, window_size_ms=100, padding_ms=50):
+    """
+    A simple energy-based silence trimmer.
+    """
+    window_size = int(sampling_rate * window_size_ms / 1000)
+    padding_samples = int(sampling_rate * padding_ms / 1000)
+    
+    wav_padded = np.pad(wav, padding_samples, mode='constant')
+    
+    energies = []
+    for i in range(0, len(wav_padded) - window_size, window_size):
+        window = wav_padded[i:i + window_size]
+        energies.append(np.sqrt(np.mean(window**2)))
+    
+    is_speech = np.array(energies) > energy_threshold
+    
+    mask = np.zeros(len(wav_padded), dtype=bool)
+    for i, speech in enumerate(is_speech):
+        if speech:
+            start_index = i * window_size
+            end_index = start_index + window_size
+            mask[start_index:end_index] = True
+            
+    mask = binary_dilation(mask, np.ones(padding_samples * 2))
+    
+    return wav_padded[mask]
 
 def normalize_volume(wav, target_dBFS, increase_only=False, decrease_only=False):
     if increase_only and decrease_only:

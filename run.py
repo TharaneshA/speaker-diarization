@@ -7,11 +7,12 @@ from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
+import torch
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from sklearn.cluster import AgglomerativeClustering
 
-from voice_analyzer import VoiceEncoder, preprocess_wav, sampling_rate
+from voice_analyzer import VoiceEncoder, preprocess_wav, sampling_rate, audio
 from plotting import interactive_diarization_plot
 
 logging.basicConfig(
@@ -29,7 +30,6 @@ def record_reference(duration=5):
     recorded_chunks = []
     
     def audio_callback_rec(indata, frames, time, status):
-        """This callback is for the reference recording."""
         if status:
             logger.warning(f"Recording status issue: {status}")
         
@@ -44,7 +44,7 @@ def record_reference(duration=5):
     with sd.InputStream(samplerate=sampling_rate, channels=1, callback=audio_callback_rec):
         time.sleep(duration)
     
-    print() 
+    print()
     logger.info("Recording finished.")
     
     return np.concatenate(recorded_chunks, axis=0)
@@ -63,7 +63,6 @@ def diarize_from_file(args):
 
     logger.info(f"Processing audio file: {input_file.name}")
     wav = preprocess_wav(input_file)
-
     encoder = VoiceEncoder("cpu")
     logger.info("Running continuous embedding on the CPU, this might take a moment...")
     _, cont_embeds, wav_splits = encoder.embed_utterance(wav, return_partials=True, rate=8)
@@ -118,10 +117,9 @@ def run_live_diarization(args):
         
         input(f"Press Enter to start recording the 5-second reference for {speaker_name}.")
         wav_ref = record_reference()
-        
         wav = preprocess_wav(wav_ref.flatten())
-        if len(wav) < sampling_rate: # Must be at least 1 second
-            logger.error("Reference recording is too quiet or empty after silence removal. Please try again and speak louder.")
+        if len(wav) < sampling_rate:
+            logger.error("Reference recording is too quiet or empty. Please try again and speak louder.")
             speaker_names.pop()
             continue
             
@@ -131,9 +129,11 @@ def run_live_diarization(args):
     logger.info("Starting live diarization. Plot window is now active.")
     
     data_queue = queue.Queue()
-
     fig, ax = plt.subplots()
     lines = [ax.plot([], [], label=name)[0] for name in speaker_names]
+    
+    text_label = ax.text(0.05, 0.9, "", transform=ax.transAxes, fontsize=12)
+    
     ax.set_ylim(0.4, 1)
     ax.set_ylabel("Similarity")
     ax.set_title("Live Speaker Diarization")
@@ -144,17 +144,26 @@ def run_live_diarization(args):
     def init_plot():
         for line in lines:
             line.set_data([], [])
-        return lines
+        return lines + [text_label]
 
     def update_plot(frame):
         while not data_queue.empty():
             similarities = data_queue.get()
-            
             new_x = (x_data[-1] + 1) if x_data else 0
             x_data.append(new_x)
             for i, sim in enumerate(similarities):
                 y_data[i].append(sim)
 
+            best_speaker_idx = np.argmax(similarities)
+            speaker_name = speaker_names[best_speaker_idx]
+            
+            message = f"Speaker: {speaker_name}"
+            text_label.set_text(message)
+            
+            _default_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+            color = _default_colors[best_speaker_idx % len(_default_colors)]
+            text_label.set_color(color)
+        
         for i, line in enumerate(lines):
             line.set_data(x_data, y_data[i])
             
@@ -164,33 +173,23 @@ def run_live_diarization(args):
         else:
             ax.set_xlim(0, max(window_size, x_data[-1] if x_data else 1))
             
-        return lines
+        return lines + [text_label]
 
     def audio_callback(indata, frames, time, status):
         if status:
             logger.warning(status)
-        
         try:
-            raw_volume = np.linalg.norm(indata)
-            logger.info(f"Received audio chunk. Raw volume: {raw_volume:.4f}")
-
             wav = preprocess_wav(indata.flatten())
             if len(wav) < 1600:
-                logger.warning("Input chunk too quiet after VAD, skipping.")
                 return
 
-            _, cont_embeds, _ = encoder.embed_utterance(wav, return_partials=True, rate=16)
-            current_similarities = [cont_embeds[-1] @ embed for embed in speaker_embeds]
-            
-            most_likely_speaker_idx = np.argmax(current_similarities)
-            max_similarity = current_similarities[most_likely_speaker_idx]
-            
-            if max_similarity > 0.65:
-                speaker_name = speaker_names[most_likely_speaker_idx]
-                logger.info(f"Speaker detected: {speaker_name} (Similarity: {max_similarity:.2f})")
-            else:
-                logger.info(f"No confident speaker match found (Max Similarity: {max_similarity:.2f})")
 
+            mels = audio.wav_to_mel_spectrogram(wav)
+            mels_tensor = torch.from_numpy(mels).unsqueeze(0)
+            with torch.no_grad():
+                embedding = encoder(mels_tensor).cpu().numpy()[0]
+
+            current_similarities = [embedding @ embed for embed in speaker_embeds]
             data_queue.put(current_similarities)
         except Exception as e:
             logger.error(f"Error in audio callback: {e}", exc_info=False)
@@ -198,14 +197,18 @@ def run_live_diarization(args):
     ani = FuncAnimation(fig, update_plot, init_func=init_plot, interval=100, blit=True, cache_frame_data=False)
     
     try:
-        with sd.InputStream(samplerate=sampling_rate, channels=1, callback=audio_callback):
-            logger.info("Microphone stream is active. Close the plot window to stop.")
-            plt.show()
-    except Exception:
-        logger.critical("Failed to start audio stream.", exc_info=True)
-    
-    logger.info("Live diarization stopped.")
+        stream = sd.InputStream(samplerate=sampling_rate, channels=1, callback=audio_callback)
+        stream.start()
+        logger.info("Microphone stream is active. Close the plot window to stop.")
+        plt.show()
 
+    except Exception as e:
+        logger.critical(f"Failed to start audio stream or plot: {e}", exc_info=True)
+    finally:
+        if 'stream' in locals() and stream.active:
+            stream.stop()
+            stream.close()
+        logger.info("Live diarization stopped.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -214,7 +217,6 @@ if __name__ == "__main__":
     )
     
     subparsers = parser.add_subparsers(dest='mode', required=True, help="Select the mode to run.")
-
     parser_file = subparsers.add_parser('file', help="Diarize an audio file.")
     parser_file.add_argument("input_file", type=str, help="Path to the audio file to process.")
     parser_file.add_argument("--num_speakers", type=int, default=2, help="Number of speakers to identify. Default: 2")
