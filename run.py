@@ -1,140 +1,227 @@
+# run.py
 import argparse
+import logging
+import queue
+import time
 from pathlib import Path
-from voice_analyzer import VoiceEncoder, preprocess_wav, sampling_rate
-from plotting import interactive_diarization_plot
+
 import numpy as np
 import sounddevice as sd
 import matplotlib.pyplot as plt
-from time import sleep
+from matplotlib.animation import FuncAnimation
+from sklearn.cluster import AgglomerativeClustering
 
-def run_file_diarization(args):
-    """Processes a single audio file and displays the diarization."""
-    audio_file = Path(args.input_file)
-    if not audio_file.exists():
-        print(f"Error: The file '{audio_file}' was not found.")
-        print("Please ensure you have downloaded the demo audio into the 'audio_data' directory.")
+from voice_analyzer import VoiceEncoder, preprocess_wav, sampling_rate
+from plotting import interactive_diarization_plot
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)-8s] - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+
+def record_reference(duration=5):
+    """
+    Records a reference audio clip with live volume feedback in the terminal.
+    """
+    recorded_chunks = []
+    
+    def audio_callback_rec(indata, frames, time, status):
+        """This callback is for the reference recording."""
+        if status:
+            logger.warning(f"Recording status issue: {status}")
+        
+        volume_norm = np.linalg.norm(indata) * 10
+        bar = '█' * int(volume_norm) + '-' * (20 - int(volume_norm))
+        line_to_print = f"Recording: [{bar}]"
+        print(f"\r{line_to_print:<40}", end="", flush=True)
+        
+        recorded_chunks.append(indata.copy())
+
+    logger.info(f"Please speak for {duration} seconds...")
+    with sd.InputStream(samplerate=sampling_rate, channels=1, callback=audio_callback_rec):
+        time.sleep(duration)
+    
+    print() 
+    logger.info("Recording finished.")
+    
+    return np.concatenate(recorded_chunks, axis=0)
+
+
+def diarize_from_file(args):
+    """
+    Processes a single audio file using clustering to identify speakers automatically.
+    """
+    input_file = Path(args.input_file)
+    num_speakers = args.num_speakers
+
+    if not input_file.exists():
+        logger.error(f"The file '{input_file}' was not found.")
         return
 
-    print(f"Processing audio file: {audio_file.name}...")
-    wav = preprocess_wav(audio_file)
-
-
-    segments = [[0, 5.5], [6.5, 12], [17, 25]]
-    speaker_names = ["Kyle Gass", "Sean Evans", "Jack Black"]
-    speaker_wavs = [wav[int(s[0] * sampling_rate):int(s[1] * sampling_rate)] for s in segments]
+    logger.info(f"Processing audio file: {input_file.name}")
+    wav = preprocess_wav(input_file)
 
     encoder = VoiceEncoder("cpu")
-    print("Running the continuous embedding on the CPU, this might take a moment...")
-    _, cont_embeds, wav_splits = encoder.embed_utterance(wav, return_partials=True, rate=16)
+    logger.info("Running continuous embedding on the CPU, this might take a moment...")
+    _, cont_embeds, wav_splits = encoder.embed_utterance(wav, return_partials=True, rate=8)
 
-    speaker_embeds = [encoder.embed_utterance(speaker_wav) for speaker_wav in speaker_wavs]
-    similarity_dict = {name: cont_embeds @ speaker_embed for name, speaker_embed in
-                       zip(speaker_names, speaker_embeds)}
+    if num_speakers > len(cont_embeds):
+        logger.error(f"The audio is too short to find {num_speakers} speakers. Try a smaller number.")
+        return
 
-    print("Launching interactive plot...")
+    logger.info("Clustering embeddings to identify speakers...")
+    clusterer = AgglomerativeClustering(n_clusters=num_speakers).fit(cont_embeds)
+    labels = clusterer.labels_
+
+    logger.info("Generating reference embeddings for each identified speaker...")
+    speaker_embeds = []
+    for i in range(num_speakers):
+        speaker_indices = np.where(labels == i)[0]
+        speaker_embed = np.mean(cont_embeds[speaker_indices], axis=0)
+        speaker_embed /= np.linalg.norm(speaker_embed)
+        speaker_embeds.append(speaker_embed)
+
+    speaker_names = [f"Speaker {i+1}" for i in range(num_speakers)]
+    similarity_dict = {name: cont_embeds @ embed for name, embed in zip(speaker_names, speaker_embeds)}
+
+    logger.info("Launching interactive plot...")
     interactive_diarization_plot(similarity_dict, wav, wav_splits)
 
+
 def run_live_diarization(args):
-    """Runs speaker diarization in real-time using the microphone."""
+    """
+    Runs speaker diarization in real-time using the microphone with a responsive plot.
+    """
     try:
         sd.query_devices()
-    except Exception as e:
-        print("Error: No audio devices found. Live diarization requires a microphone.")
-        print(f"Details: {e}")
+    except Exception:
+        logger.error("No audio devices found. Live diarization requires a microphone.", exc_info=True)
         return
 
     encoder = VoiceEncoder("cpu")
     speaker_embeds = []
     speaker_names = []
 
-    print("--- Real-Time Speaker Diarization ---")
+    logger.info("Real-Time Speaker Diarization.")
     
-    # Record reference audio for each speaker
     while True:
-        speaker_name = input(f"Enter the name for speaker {len(speaker_names) + 1} (or press Enter to start): ")
+        speaker_name = input(f"Enter name for speaker {len(speaker_names) + 1} (or press Enter to start): ")
         if not speaker_name:
             if not speaker_names:
-                print("Please add at least one speaker.")
+                logger.warning("Please add at least one speaker to start.")
                 continue
             break
         speaker_names.append(speaker_name)
         
-        input(f"Press Enter and speak for 5 seconds to record the reference for {speaker_name}.")
-        print("Recording...")
-        wav = sd.rec(int(5 * sampling_rate), samplerate=sampling_rate, channels=1)
-        sd.wait()
-        wav = preprocess_wav(wav.flatten())
+        input(f"Press Enter to start recording the 5-second reference for {speaker_name}.")
+        wav_ref = record_reference()
+        
+        wav = preprocess_wav(wav_ref.flatten())
+        if len(wav) < sampling_rate: # Must be at least 1 second
+            logger.error("Reference recording is too quiet or empty after silence removal. Please try again and speak louder.")
+            speaker_names.pop()
+            continue
+            
         speaker_embeds.append(encoder.embed_utterance(wav))
-        print(f"Reference for {speaker_name} recorded.")
+        logger.info(f"Reference for {speaker_name} processed successfully.")
 
-    print("\nStarting live diarization. The plot will update in real-time. Press Ctrl+C in the terminal to stop.")
+    logger.info("Starting live diarization. Plot window is now active.")
+    
+    data_queue = queue.Queue()
 
-    # Live plotting setup
     fig, ax = plt.subplots()
     lines = [ax.plot([], [], label=name)[0] for name in speaker_names]
     ax.set_ylim(0.4, 1)
     ax.set_ylabel("Similarity")
     ax.set_title("Live Speaker Diarization")
     ax.legend(loc="lower right")
-    fig.show()
+    
+    x_data, y_data = [], [[] for _ in speaker_names]
+    
+    def init_plot():
+        for line in lines:
+            line.set_data([], [])
+        return lines
 
-    # Audio stream processing
+    def update_plot(frame):
+        while not data_queue.empty():
+            similarities = data_queue.get()
+            
+            new_x = (x_data[-1] + 1) if x_data else 0
+            x_data.append(new_x)
+            for i, sim in enumerate(similarities):
+                y_data[i].append(sim)
+
+        for i, line in enumerate(lines):
+            line.set_data(x_data, y_data[i])
+            
+        window_size = 200
+        if len(x_data) > window_size:
+            ax.set_xlim(x_data[-window_size], x_data[-1])
+        else:
+            ax.set_xlim(0, max(window_size, x_data[-1] if x_data else 1))
+            
+        return lines
+
     def audio_callback(indata, frames, time, status):
         if status:
-            print(status)
+            logger.warning(status)
         
         try:
+            raw_volume = np.linalg.norm(indata)
+            logger.info(f"Received audio chunk. Raw volume: {raw_volume:.4f}")
+
             wav = preprocess_wav(indata.flatten())
-            if len(wav) < 1600:  # Not enough audio to process
+            if len(wav) < 1600:
+                logger.warning("Input chunk too quiet after VAD, skipping.")
                 return
 
             _, cont_embeds, _ = encoder.embed_utterance(wav, return_partials=True, rate=16)
-            
-            # Get the latest similarity scores
             current_similarities = [cont_embeds[-1] @ embed for embed in speaker_embeds]
-
-            # Update plot data
-            for i, line in enumerate(lines):
-                xdata, ydata = line.get_data()
-                new_x = xdata[-1] + 1 if len(xdata) > 0 else 0
-                line.set_data(np.append(xdata, new_x), np.append(ydata, current_similarities[i]))
             
-            ax.relim()
-            ax.autoscale_view(True, True, True)
-            fig.canvas.draw()
-            fig.canvas.flush_events()
+            most_likely_speaker_idx = np.argmax(current_similarities)
+            max_similarity = current_similarities[most_likely_speaker_idx]
+            
+            if max_similarity > 0.65:
+                speaker_name = speaker_names[most_likely_speaker_idx]
+                logger.info(f"Speaker detected: {speaker_name} (Similarity: {max_similarity:.2f})")
+            else:
+                logger.info(f"No confident speaker match found (Max Similarity: {max_similarity:.2f})")
 
+            data_queue.put(current_similarities)
         except Exception as e:
-            print(f"Error during processing: {e}")
+            logger.error(f"Error in audio callback: {e}", exc_info=False)
 
+    ani = FuncAnimation(fig, update_plot, init_func=init_plot, interval=100, blit=True, cache_frame_data=False)
+    
+    try:
+        with sd.InputStream(samplerate=sampling_rate, channels=1, callback=audio_callback):
+            logger.info("Microphone stream is active. Close the plot window to stop.")
+            plt.show()
+    except Exception:
+        logger.critical("Failed to start audio stream.", exc_info=True)
+    
+    logger.info("Live diarization stopped.")
 
-    with sd.InputStream(samplerate=sampling_rate, channels=1, callback=audio_callback):
-        while True:
-            sleep(0.1) # Keep the main thread alive
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="""A command-line tool for speaker diarization.
-        You can either run it on a pre-existing audio file or in real-time with a microphone."""
+        description="A tool for speaker diarization on audio files or live microphone input.",
+        formatter_class=argparse.RawTextHelpFormatter
     )
     
-    # Use a mutually exclusive group to ensure only one mode is selected
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--input_file", 
-        type=str, 
-        default="audio_data/X2zqiX6yL3I.mp3",
-        help="Path to the audio file to process. Defaults to the demo file."
-    )
-    group.add_argument(
-        "--live", 
-        action="store_true", 
-        help="Run diarization in real-time using the microphone."
-    )
+    subparsers = parser.add_subparsers(dest='mode', required=True, help="Select the mode to run.")
+
+    parser_file = subparsers.add_parser('file', help="Diarize an audio file.")
+    parser_file.add_argument("input_file", type=str, help="Path to the audio file to process.")
+    parser_file.add_argument("--num_speakers", type=int, default=2, help="Number of speakers to identify. Default: 2")
+    parser_file.set_defaults(func=diarize_from_file)
+    
+    parser_live = subparsers.add_parser('live', help="Diarize from a live microphone stream.")
+    parser_live.set_defaults(func=run_live_diarization)
     
     args = parser.parse_args()
-
-    if args.live:
-        run_live_diarization(args)
-    else:
-        run_file_diarization(args)
+    args.func(args)

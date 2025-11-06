@@ -1,3 +1,4 @@
+# plotting.py
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -34,7 +35,7 @@ def interactive_diarization_plot(similarity_dict, wav, wav_splits, x_crop=5, sho
         return lines + [text]
 
     times = [((s.start + s.stop) / 2) / sampling_rate for s in wav_splits]
-    rate = 1 / (times[1] - times[0])
+    rate = 1 / (times[1] - times[0]) if len(times) > 1 else 1
     crop_range = int(np.round(x_crop * rate))
     ticks = np.arange(0, len(wav_splits), rate)
     ref_time = timer()
@@ -71,9 +72,11 @@ def interactive_diarization_plot(similarity_dict, wav, wav_splits, x_crop=5, sho
         if current_time < times[i]:
             sleep(times[i] - current_time)
         elif current_time - 0.2 > times[i]:
-            print("Animation is delayed further than 200ms!", file=stderr)
+            import logging
+            logging.warning("Animation is delayed further than 200ms!")
         return lines + [text]
 
     ani = FuncAnimation(fig, update, frames=len(wav_splits), init_func=init, blit=not show_time, repeat=False, interval=1)
-    play_wav(wav, blocking=False)
+    if wav is not None:
+        play_wav(wav, blocking=False)
     plt.show()
