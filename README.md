@@ -14,6 +14,8 @@ The core of this tool is a deep learning voice encoder model that generates a hi
 
 ---
 
+<img width="633" height="546" alt="image" src="https://github.com/user-attachments/assets/d2009df0-de30-4e4e-be1c-1ca92d177152" />
+
 ## Project Structure
 
 The repository is organized to be modular and easy to understand.
